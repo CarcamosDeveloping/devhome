@@ -4,7 +4,6 @@
 using System;
 using System.Linq;
 using System.Threading.Tasks;
-using AdaptiveCards.Rendering.WinUI3;
 using CommunityToolkit.Mvvm.Input;
 using DevHome.Common.Extensions;
 using DevHome.Dashboard.Helpers;
@@ -18,29 +17,30 @@ using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Imaging;
 using Microsoft.UI.Xaml.Shapes;
 using Microsoft.Windows.Widgets.Hosts;
-using WinUIEx;
 
 namespace DevHome.Dashboard.Views;
 
 public sealed partial class AddWidgetDialog : ContentDialog
 {
-    private Widget _currentWidget;
+    private WidgetDefinition _currentWidget;
     private static DispatcherQueue _dispatcher;
 
-    public Widget AddedWidget { get; set; }
+    public WidgetDefinition AddedWidget { get; set; }
 
-    public WidgetViewModel ViewModel { get; set; }
+    public AddWidgetViewModel ViewModel { get; set; }
 
     private readonly IWidgetHostingService _hostingService;
     private readonly IWidgetIconService _widgetIconService;
+    private readonly IWidgetScreenshotService _widgetScreenshotService;
 
     public AddWidgetDialog(
         DispatcherQueue dispatcher,
         ElementTheme theme)
     {
-        ViewModel = new WidgetViewModel(null, Microsoft.Windows.Widgets.WidgetSize.Large, null, dispatcher);
+        ViewModel = new AddWidgetViewModel();
         _hostingService = Application.Current.GetService<IWidgetHostingService>();
         _widgetIconService = Application.Current.GetService<IWidgetIconService>();
+        _widgetScreenshotService = Application.Current.GetService<IWidgetScreenshotService>();
 
         this.InitializeComponent();
 
@@ -49,9 +49,6 @@ public sealed partial class AddWidgetDialog : ContentDialog
         // Strange behavior: just setting the requested theme when we new-up the dialog results in
         // the wrong theme's resources being used. Setting RequestedTheme here fixes the problem.
         RequestedTheme = theme;
-
-        // Get the application root window so we know when it has closed.
-        Application.Current.GetService<WindowEx>().Closed += OnMainWindowClosed;
     }
 
     [RelayCommand]
@@ -128,7 +125,7 @@ public sealed partial class AddWidgetDialog : ContentDialog
         // If there were no available widgets, show a message.
         if (!AddWidgetNavigationView.MenuItems.Any())
         {
-            ViewModel.ShowErrorCard("WidgetErrorCardNoWidgetsText");
+            //// TODO ViewModel.ShowErrorCard("WidgetErrorCardNoWidgetsText");
         }
     }
 
@@ -208,11 +205,6 @@ public sealed partial class AddWidgetDialog : ContentDialog
         NavigationView sender,
         NavigationViewSelectionChangedEventArgs args)
     {
-        // Delete previously shown configuration widget.
-        // Clearing the UI here results in a flash, so don't bother. It will update soon.
-        Log.Logger()?.ReportDebug("AddWidgetDialog", $"Widget selection changed, delete widget if one exists");
-        var clearWidgetTask = ClearCurrentWidget();
-
         // Selected item could be null if list of widgets became empty.
         if (sender.SelectedItem is null)
         {
@@ -227,49 +219,24 @@ public sealed partial class AddWidgetDialog : ContentDialog
             return;
         }
 
-        // If the user has selected a widget, show configuration UI. If they selected a provider, leave space blank.
+        // If the user has selected a widget, show preview. If they selected a provider, leave space blank.
         if (selectedTag as WidgetDefinition is WidgetDefinition selectedWidgetDefinition)
         {
-            var size = WidgetHelpers.GetLargestCapabilitySize(selectedWidgetDefinition.GetWidgetCapabilities());
+            var bitmap = await _widgetScreenshotService.GetScreenshotFromCache(selectedWidgetDefinition, ActualTheme);
 
-            // Create the widget for configuration. We will need to delete it if the user closes the dialog
-            // without pinning, or selects a different widget.
-            Widget widget = null;
-            try
+            ViewModel.WidgetDisplayTitle = selectedWidgetDefinition.DisplayTitle;
+            ViewModel.WidgetProviderDisplayTitle = selectedWidgetDefinition.ProviderDefinition.DisplayName;
+            ViewModel.WidgetScreenshot = new ImageBrush
             {
-                var widgetHost = await _hostingService.GetWidgetHostAsync();
-                widget = await Task.Run(async () => await widgetHost?.CreateWidgetAsync(selectedWidgetDefinition.Id, size));
-            }
-            catch (Exception ex)
-            {
-                Log.Logger()?.ReportWarn("AddWidgetDialog", $"CreateWidgetAsync failed: ", ex);
-            }
+                ImageSource = bitmap,
+            };
+            ViewModel.PinButtonVisibility = true;
 
-            if (widget is not null)
-            {
-                Log.Logger()?.ReportInfo("AddWidgetDialog", $"Created Widget {widget.Id}");
-
-                ViewModel.Widget = widget;
-                ViewModel.IsInAddMode = true;
-                PinButton.Visibility = Visibility.Visible;
-
-                var widgetCatalog = await _hostingService.GetWidgetCatalogAsync();
-                ViewModel.WidgetDefinition = await Task.Run(() => widgetCatalog?.GetWidgetDefinition(widget.DefinitionId));
-
-                clearWidgetTask.Wait();
-            }
-            else
-            {
-                Log.Logger()?.ReportWarn("AddWidgetDialog", $"Widget creation failed.");
-                ViewModel.ShowErrorCard("WidgetErrorCardCreate1Text", "WidgetErrorCardCreate2Text");
-            }
-
-            _currentWidget = widget;
+            _currentWidget = selectedWidgetDefinition;
         }
         else if (selectedTag as WidgetProviderDefinition is not null)
         {
-            ConfigurationContentFrame.Content = null;
-            PinButton.Visibility = Visibility.Collapsed;
+            ViewModel.Clear();
         }
     }
 
@@ -280,11 +247,11 @@ public sealed partial class AddWidgetDialog : ContentDialog
         HideDialogAsync();
     }
 
-    private async void CancelButton_Click(object sender, RoutedEventArgs e)
+    private void CancelButton_Click(object sender, RoutedEventArgs e)
     {
         // Delete previously shown configuration card.
-        Log.Logger()?.ReportDebug("AddWidgetDialog", $"Canceled dialog, delete widget");
-        await ClearCurrentWidget();
+        Log.Logger()?.ReportDebug("AddWidgetDialog", $"Canceled dialog");
+        _currentWidget = null;
 
         HideDialogAsync();
     }
@@ -294,28 +261,10 @@ public sealed partial class AddWidgetDialog : ContentDialog
         _currentWidget = null;
         ViewModel = null;
 
-        Application.Current.GetService<WindowEx>().Closed -= OnMainWindowClosed;
         var widgetCatalog = await _hostingService.GetWidgetCatalogAsync();
         widgetCatalog!.WidgetDefinitionDeleted -= WidgetCatalog_WidgetDefinitionDeleted;
 
         this.Hide();
-    }
-
-    private async void OnMainWindowClosed(object sender, WindowEventArgs args)
-    {
-        Log.Logger()?.ReportInfo("AddWidgetDialog", $"Window Closed, delete partially created widget");
-        await ClearCurrentWidget();
-    }
-
-    private async Task ClearCurrentWidget()
-    {
-        if (_currentWidget != null)
-        {
-            var widgetIdToDelete = _currentWidget.Id;
-            await _currentWidget.DeleteAsync();
-            Log.Logger()?.ReportInfo("AddWidgetDialog", $"Deleted Widget {widgetIdToDelete}");
-            _currentWidget = null;
-        }
     }
 
     private void WidgetCatalog_WidgetDefinitionDeleted(WidgetCatalog sender, WidgetDefinitionDeletedEventArgs args)
@@ -326,10 +275,9 @@ public sealed partial class AddWidgetDialog : ContentDialog
         {
             // If we currently have the deleted widget open, show an error message instead.
             if (_currentWidget is not null &&
-                _currentWidget.DefinitionId.Equals(deletedDefinitionId, StringComparison.Ordinal))
+                _currentWidget.Id.Equals(deletedDefinitionId, StringComparison.Ordinal))
             {
-                Log.Logger()?.ReportInfo("AddWidgetDialog", $"Widget definition deleted while creating that widget.");
-                ViewModel.ShowErrorCard("WidgetErrorCardCreate1Text", "WidgetErrorCardCreate2Text");
+                Log.Logger()?.ReportInfo("AddWidgetDialog", $"Widget definition deleted while selected.");
                 AddWidgetNavigationView.SelectedItem = null;
             }
 
@@ -353,7 +301,7 @@ public sealed partial class AddWidgetDialog : ContentDialog
                                 // If we've removed all providers from the list, show a message.
                                 if (!menuItems.Any())
                                 {
-                                    ViewModel.ShowErrorCard("WidgetErrorCardNoWidgetsText");
+                                    // TODO
                                 }
                             }
                         }
